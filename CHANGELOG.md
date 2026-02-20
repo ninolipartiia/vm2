@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/matter-labs/vm2/compare/v0.5.0...v0.6.0) (2026-02-20)
+
+
+### Features
+
+* Update protocol dependencies ([#93](https://github.com/matter-labs/vm2/issues/93)) ([e3d1830](https://github.com/matter-labs/vm2/commit/e3d183076f1a11c4bdce625c6f9ff342ad7641e4))
+
 ## [0.5.0](https://github.com/matter-labs/vm2/compare/v0.4.0...v0.5.0) (2025-10-20)
 
 
