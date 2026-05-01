@@ -1,6 +1,10 @@
 use primitive_types::{H160, U256};
 use zkevm_opcode_defs::{
-    decoding::EncodingModeProduction, ethereum_types::Address, system_params::VM_MAX_STACK_DEPTH,
+    decoding::EncodingModeProduction,
+    ethereum_types::Address,
+    system_params::{
+        NEW_EVM_FRAME_MEMORY_STIPEND, NEW_FRAME_MEMORY_STIPEND, VM_MAX_STACK_DEPTH,
+    },
     Condition, DecodedOpcode, ImmMemHandlerFlags, Opcode, Operand, RegOrImmFlags, UMAOpcode,
     OPCODES_TABLE, UMA_INCREMENT_FLAG_IDX,
 };
@@ -10,6 +14,7 @@ use crate::{
     addressing_modes::{Arguments, Immediate1, Register, Register1, Register2},
     decode::decode,
     fat_pointer::FatPointer,
+    instruction_handlers::address_into_u256,
     page_ids::{
         aux_heap_page_from_base, first_dynamic_base_page, heap_page_from_base, next_page_group,
     },
@@ -1082,4 +1087,331 @@ fn rollback_should_restore_bootloader_heap_after_fresh_decommit() {
 
     vm.rollback();
     assert_eq!(vm.state.heaps[bootloader_heap].read_u256(0), sentinel);
+}
+
+#[test]
+fn far_call_to_unconstructed_evm_downgrades_stipend_versus_zk_evm() {
+    // Regression test for the AFL fuzz crash documented in
+    // `security-review/fuzz-crash-id000000-evm-stipend.md`.
+    //
+    // Setup: a non-kernel caller issues a non-constructor `FarCall<Delegate>` to a
+    // non-kernel destination whose deployer-storage entry has the EVM-blob version
+    // byte (`V[0] == 0x02`) AND the "in construction" marker (`V[1] == 0x01`).
+    //
+    // zk_evm reference behaviour (see zk_evm/src/opcodes/execution/far_call.rs:660-668):
+    //     code_version_byte = V[0];
+    //     // ... `mask_to_default_aa = true` is set later ...
+    //     memory_stipend_userspace = (code_version_byte == BlobSha256Format::VERSION_BYTE)
+    //         ? NEW_EVM_FRAME_MEMORY_STIPEND  // 57344
+    //         : NEW_FRAME_MEMORY_STIPEND;     // 4096
+    // → zk_evm grants `NEW_EVM_FRAME_MEMORY_STIPEND` purely on the version byte,
+    //   independent of the construction-state mask.
+    //
+    // vm2 behaviour (see decommit.rs:60-111 and callframe.rs:78-85): the stipend
+    // is keyed off `is_evm_interpreter`, which is only set in the `code_info_bytes[0] == 2`
+    // branch *and* when `is_constructed != is_constructor_call`. With this storage
+    // value (V[1]=0x01 → is_constructed=false) and an effective is_constructor_call=false
+    // (forced by the `current_frame.is_kernel` mask in far_call.rs:52), the equality
+    // holds, vm2 returns the default-AA hash with `is_evm = false`, and the new frame
+    // gets `NEW_FRAME_MEMORY_STIPEND` (4096) instead of 57344.
+    //
+    // This test asserts vm2's *current* behaviour, locking in the divergence so that
+    // a future fix (which should align vm2 with zk_evm) will fail this test loudly
+    // and prompt updating the assertion to `NEW_EVM_FRAME_MEMORY_STIPEND`.
+    //
+    // Limitations / assumptions:
+    //   * Single-VM test: we only execute the FarCall in vm2, not in zk_evm. The
+    //     reference value (57344) is read from the pinned zk_evm source. A true
+    //     differential test lives in `tests/afl-fuzz` and reproduces the exact
+    //     fuzzer crash via `show_testcase`.
+    //   * `TestWorld` is a thin in-memory world that returns whatever U256 we
+    //     inject for the deployer-storage slot of the destination address. This
+    //     is the same behaviour as the production `World` would exhibit if a real
+    //     contract were mid-construction; the fuzzer's mock storage path does not
+    //     change the divergence — both VMs read the *same* injected value.
+    //   * The destination address is non-kernel and the caller is non-kernel, so
+    //     `is_kernel` cannot short-circuit the stipend choice.
+    //   * Gas is set generously so that decommit payment cannot fail and abort
+    //     the FarCall before the stipend is computed.
+    //   * The injected hash's length-in-words is 0; this is intentional because
+    //     vm2 masks to the default-AA hash before decommitting, so the injected
+    //     hash itself is never decommitted (only its first two bytes drive the
+    //     mask logic).
+
+    // Register a default-AA program in the test world and use its hash as the
+    // configured `default_aa_code_hash` so the post-mask decommit succeeds.
+    let aa_address = Address::from_low_u64_be(0x1234);
+    let aa_program = Program::from_raw(vec![ret_instruction()], vec![]);
+    let mut world = TestWorld::new(&[(aa_address, aa_program)]);
+    let default_aa_hash_u256 = *world
+        .address_to_hash
+        .get(&address_into_u256(aa_address))
+        .expect("default AA hash must exist");
+    let mut default_aa_code_hash = [0u8; 32];
+    default_aa_hash_u256.to_big_endian(&mut default_aa_code_hash);
+
+    // Inject the "EVM bytecode under construction" deployer-storage entry for
+    // the destination address. Bytes: [0x02, 0x01, len_hi=0, len_lo=0, ..., tag].
+    let destination_address = Address::repeat_byte(0x5a); // non-kernel
+    let mut evm_construction_bytes = [0u8; 32];
+    evm_construction_bytes[0] = 0x02; // BlobSha256Format::VERSION_BYTE
+    evm_construction_bytes[1] = 0x01; // in construction
+    evm_construction_bytes[28..].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+    let evm_construction_hash = U256::from_big_endian(&evm_construction_bytes);
+    world.address_to_hash.insert(
+        address_into_u256(destination_address),
+        evm_construction_hash,
+    );
+
+    let settings = Settings {
+        default_aa_code_hash,
+        evm_interpreter_code_hash: [0u8; 32],
+        hook_address: 0,
+    };
+
+    let far_call = Instruction::from_far_call::<opcodes::Delegate>(
+        Register1(Register::new(1)),
+        Register2(Register::new(2)),
+        Immediate1(1),
+        false, // is_static
+        false, // is_shard
+        Arguments::new(Predicate::Always, 200, ModeRequirements::none()),
+    );
+    let program = Program::from_raw(vec![far_call, ret_instruction()], vec![]);
+
+    let mut vm = VirtualMachine::new(
+        non_kernel_address(),
+        program,
+        Address::zero(),
+        &[],
+        1_000_000_000,
+        settings,
+    );
+
+    let mut far_call_abi = U256::zero();
+    far_call_abi.0[3] = 100_000; // gas to pass
+    vm.state.register_pointer_flags &= !(1 << 1);
+    vm.state.registers[1] = far_call_abi;
+    vm.state.registers[2] = address_into_u256(destination_address);
+
+    execute_one_instruction(&mut vm, &mut world, &mut ());
+
+    // The new frame should be the called frame, with the destination as its code address.
+    assert_eq!(vm.state.current_frame.code_address, destination_address);
+
+    // Sanity: caller is non-kernel and destination is non-kernel, so neither
+    // the kernel-stipend short-circuit nor a `try_default_aa = None` path is hit.
+    assert!(!vm.state.current_frame.is_kernel);
+
+    // Divergence point: zk_evm grants NEW_EVM_FRAME_MEMORY_STIPEND (57344) here;
+    // vm2 grants NEW_FRAME_MEMORY_STIPEND (4096). Locking in vm2's current value.
+    assert_eq!(
+        vm.state.current_frame.heap_size, NEW_FRAME_MEMORY_STIPEND,
+        "vm2 currently downgrades the stipend on construction-state default-AA \
+         mask; zk_evm reference grants {NEW_EVM_FRAME_MEMORY_STIPEND}. \
+         If this assertion starts failing because the value is now \
+         {NEW_EVM_FRAME_MEMORY_STIPEND}, the divergence has been fixed — flip \
+         this test to expect that value.",
+    );
+    assert_eq!(
+        vm.state.current_frame.aux_heap_size, NEW_FRAME_MEMORY_STIPEND,
+        "aux_heap stipend should track the heap stipend",
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // long-form doc comment + step-by-step assertions
+fn rollback_should_deallocate_dynamic_decommit_page_pinned_outside_bootloader_frame() {
+    // Regression test for `security-review/decommit-rollback-leak.md`.
+    //
+    // When the kernel-only `Decommit` opcode runs from a non-bootloader frame
+    // (e.g. Code Oracle reached via FarCall), `materialize_decommit_page` skips
+    // the keep-alive push because the candidate page (passed by the opcode
+    // handler as `vm.state.current_frame.heap`) IS the current frame's heap.
+    // The page is recorded only as a global pin in
+    // `WorldDiff::decommit_pinned_pages`. On `pop_frame`, the global pin causes
+    // the dynamic heap slot to be skipped during deallocation. On the
+    // subsequent `vm.rollback()`:
+    //   * `WorldDiff::external_rollback` reverts the pin set, un-pinning the
+    //     page (`world_diff.rs:459-477`);
+    //   * `State::rollback` only deallocates pages drained from the bootloader
+    //     frame's `heaps_i_am_keeping_alive` (`state.rs:140-168`); the orphan
+    //     is not in that list;
+    //   * `Heaps::rollback` only replays bootloader heap/aux logs
+    //     (`heap.rs:416-426`); it does not touch `dynamic`.
+    // Net effect: the dynamic slot for the orphan remains `Some(...)` in
+    // `state.heaps.dynamic` while `next_base_page` has been rolled back to its
+    // pre-snapshot value. The next far-call that re-derives the same base page
+    // hits `allocate_at -> assert!(slot.is_none())` and panics.
+    //
+    // This test reproduces the trigger via real opcodes (`Decommit`) and the
+    // real frame/snapshot machinery (`make_snapshot`, `push_frame`, `pop_frame`,
+    // `rollback`), then proves the consequence end-to-end by re-pushing a frame
+    // onto the same base page and catching the resulting panic.
+    //
+    // Limitations / assumptions:
+    //
+    //   * Single-VM test — zk_evm is not run in parallel; the divergence claim
+    //     ("zk_evm would not panic in this flow") is documented in the security
+    //     review but not validated here against a live zk_evm. The local panic
+    //     reproduces deterministically in vm2.
+    //   * Uses `vm.push_frame` directly rather than driving a real `FarCall`
+    //     opcode. This mirrors what FarCall does internally (`allocate_base_page`
+    //     + `Callframe::new` with a fresh dynamic heap) without depending on
+    //     deployer-storage / decommit lookups. The bug reproduces as long as the
+    //     `Decommit` opcode runs in a frame whose `current_frame.heap` is a
+    //     dynamic page; how that frame got there is incidental.
+    //   * The Decommit opcode itself is invoked with `Predicate::Always` /
+    //     `ModeRequirements::none()`. In production, Decommit is kernel-mode-
+    //     only, but the kernel check is in the encoded predicate, not in the
+    //     materialise path under test. The bug reproduces purely from the
+    //     candidate-page == current-frame.heap equality.
+    //   * The bootloader frame is initialised with `kernel_address()` so that
+    //     `make_snapshot` and `rollback` (which require being in the bootloader
+    //     frame) succeed. The pushed frame also uses `kernel_address()` to
+    //     match the pattern in `nonfresh_decommit_should_keep_page_alive_after_nested_frame_returns`,
+    //     which already verified the keep-alive precondition.
+    //   * The test locks in vm2's *current* (buggy) behaviour: the orphan
+    //     persists post-rollback AND re-pushing panics. If a future fix
+    //     (e.g. sweeping `state.heaps.dynamic` during `State::rollback`)
+    //     deallocates the orphan, this test will start failing at the
+    //     `orphan_persists` assertion or the panic-catch — at which point the
+    //     assertions should be flipped to assert the page is gone and the
+    //     re-push succeeds.
+
+    let code_word = U256::from(0xfeed_u64);
+    let contract = (
+        non_kernel_address(),
+        Program::from_raw(vec![ret_instruction()], vec![code_word]),
+    );
+    let mut world = TestWorld::new(&[contract]);
+    let code_hash = *world
+        .address_to_hash
+        .values()
+        .next()
+        .expect("test contract hash must exist");
+
+    let nested_decommit = Instruction::from_decommit(
+        Register1(Register::new(1)),
+        Register2(Register::new(2)),
+        Register1(Register::new(3)),
+        Arguments::new(Predicate::Always, 5, ModeRequirements::none()),
+    );
+    let nested_program = Program::from_raw(vec![nested_decommit], vec![]);
+
+    let bootloader_program = Program::from_raw(vec![ret_instruction()], vec![]);
+    let mut vm = VirtualMachine::new(
+        kernel_address(),
+        bootloader_program,
+        Address::zero(),
+        &[],
+        1_000_000,
+        default_settings(),
+    );
+
+    // Step 1: snapshot in the bootloader frame.
+    vm.make_snapshot();
+
+    // Step 2: push a non-bootloader kernel frame; its `current_frame.heap` is
+    // a dynamic page derived from `next_base_page`.
+    let calldata_heap = vm.state.current_frame.calldata_heap;
+    let snapshot_for_nested = vm.world_diff.snapshot();
+    vm.push_frame::<opcodes::Normal>(
+        kernel_address(),
+        nested_program,
+        200_000,
+        0,
+        false,
+        false,
+        calldata_heap,
+        snapshot_for_nested,
+    );
+    let nested_heap = vm.state.current_frame.heap;
+
+    // Step 3: execute Decommit. The materialised page is the current frame's
+    // heap, so `materialize_decommit_page` registers the global pin only and
+    // skips the keep-alive push.
+    vm.state.registers[1] = code_hash;
+    vm.state.registers[2] = U256::zero();
+    execute_one_instruction(&mut vm, &mut world, &mut ());
+    let pinned = FatPointer::from(vm.state.registers[3]);
+    assert_eq!(
+        pinned.memory_page, nested_heap,
+        "Decommit must reuse the calling frame's heap as the candidate page",
+    );
+    assert!(
+        vm.world_diff.is_decommit_page_pinned(nested_heap),
+        "Decommit must globally pin the materialised page",
+    );
+    let nested_owns_page = vm
+        .state
+        .current_frame
+        .heaps_i_am_keeping_alive
+        .contains(&nested_heap);
+    assert!(
+        !nested_owns_page,
+        "When candidate == current_frame.heap, materialise must skip the keep-alive push \
+         (precondition for the leak)",
+    );
+
+    // Step 4: pop the nested frame back to the bootloader. The pin keeps the
+    // dynamic slot alive.
+    vm.pop_frame(None)
+        .expect("nested frame must be present for pop");
+    assert!(
+        vm.state.heaps.contains(nested_heap),
+        "Pinned dynamic page must survive frame pop",
+    );
+
+    // Step 5: rollback to the bootloader-frame snapshot. This un-pins the page
+    // but should also deallocate it; today it does not.
+    vm.rollback();
+    assert!(
+        !vm.world_diff.is_decommit_page_pinned(nested_heap),
+        "external_rollback must revert the pin",
+    );
+    let orphan_persists = vm.state.heaps.contains(nested_heap);
+    assert!(
+        orphan_persists,
+        "vm2 currently leaks the dynamic decommit page across rollback. \
+         If this assertion fires because the page WAS deallocated, the bug \
+         has been fixed — flip this assertion to expect the page is gone.",
+    );
+
+    // Step 6: push a fresh frame. Because `next_base_page` was restored on
+    // rollback, `allocate_base_page` returns the base of the orphan. The
+    // resulting `allocate_at(heap_page)` panics on `assert!(slot.is_none())`.
+    let same_base_program = Program::from_raw(vec![ret_instruction()], vec![]);
+    let bootloader_calldata_heap = vm.state.current_frame.calldata_heap;
+    let snapshot_for_re_push = vm.world_diff.snapshot();
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vm.push_frame::<opcodes::Normal>(
+            kernel_address(),
+            same_base_program,
+            200_000,
+            0,
+            false,
+            false,
+            bootloader_calldata_heap,
+            snapshot_for_re_push,
+        );
+    }));
+    std::panic::set_hook(prev_hook);
+
+    let err = result.expect_err(
+        "Re-pushing a frame onto the orphaned base page must panic in vm2 today. \
+         If this push succeeded, the leak has been fixed.",
+    );
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    assert!(
+        msg.contains("is already allocated"),
+        "Panic should be a heap allocation conflict, got: {msg}",
+    );
 }

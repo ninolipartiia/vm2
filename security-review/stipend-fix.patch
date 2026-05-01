@@ -1,0 +1,213 @@
+# Fix: align EVM frame memory stipend with zk_evm
+#
+# Closes the vm2 vs zk_evm state divergence documented in:
+#   - security-review/fuzz-crash-id000000-evm-stipend.md
+#   - security-review/fuzz-crash-id000001-evm-stipend.md
+#   - security-review/fuzz-crash-id000002-evm-stipend.md
+#   - security-review/fuzz-crash-id000003-evm-stipend.md
+#
+# Root cause: vm2 keyed the new frame's heap/aux-heap stipend on `is_evm`,
+# which is only set when the deployer-storage version byte is 0x02 *and* the
+# construction-state predicate (`is_constructed != is_constructor_call`) is
+# satisfied. zk_evm keys the stipend on `code_version_byte == 0x02` alone
+# (zk_evm/src/opcodes/execution/far_call.rs:660-664), independent of whether
+# the call masks to the default AA.
+#
+# Fix: introduce a separate `is_evm_blob_format` flag in `WorldDiff::decommit`
+# (set whenever `code_info_bytes[0] == 0x02`, regardless of mask) and plumb it
+# through `far_call.rs` -> `vm.push_frame` -> `Callframe::new`, where it now
+# drives the stipend selection. `is_evm_interpreter` retains its prior meaning
+# in `far_call.rs` (gates `is_static && !is_evm_interpreter` and the
+# `call_type` encoding), exactly mirroring zk_evm's split between
+# `code_version_byte` (stipend) and `call_to_evm_emulator` (static / call_type).
+#
+# Validation:
+#   - `crates/vm2/src/tests/divergence_regressions.rs::
+#      far_call_to_unconstructed_evm_downgrades_stipend_versus_zk_evm` now
+#     asserts NEW_EVM_FRAME_MEMORY_STIPEND (57344) and passes after the fix.
+#   - All 49 vm2 lib tests pass under the default feature set.
+#   - The 4 single_instruction_test precompile failures observed locally
+#     (`Should use arbitrary heap, not fresh heap in testing.`) are
+#     pre-existing on the popzxc-airbender-eravm branch and unrelated.
+#
+# Apply with:  git apply security-review/stipend-fix.patch
+
+--- a/crates/vm2/src/decommit.rs
++++ b/crates/vm2/src/decommit.rs
+@@ -53,11 +53,16 @@
+         evm_interpreter_code_hash: [u8; 32],
+         is_constructor_call: bool,
+         tx_number_in_block: u16,
+-    ) -> Option<(UnpaidDecommit, bool)> {
++    ) -> Option<(UnpaidDecommit, bool, bool)> {
+         let deployer_system_contract_address =
+             Address::from_low_u64_be(DEPLOYER_SYSTEM_CONTRACT_ADDRESS_LOW.into());
+ 
+         let mut is_evm = false;
++        // Whether the deployer-storage entry is in EVM blob format (`code_version_byte == 0x02`).
++        // Tracked separately from `is_evm` so that the new frame's heap stipend can match
++        // zk_evm, which keys the stipend on the version byte alone — even when the call
++        // ultimately masks to the default AA. See zk_evm/src/opcodes/execution/far_call.rs:660-664.
++        let mut is_evm_blob_format = false;
+ 
+         let mut code_info = {
+             let code_info = self.read_storage_without_refund(
+@@ -98,6 +103,7 @@
+                     }
+                 }
+                 2 => {
++                    is_evm_blob_format = true;
+                     if is_constructed == is_constructor_call {
+                         try_default_aa?
+                     } else {
+@@ -131,6 +137,7 @@
+                 should_materialize,
+             },
+             is_evm,
++            is_evm_blob_format,
+         ))
+     }
+ 
+--- a/crates/vm2/src/callframe.rs
++++ b/crates/vm2/src/callframe.rs
+@@ -72,13 +72,16 @@
+         exception_handler: u16,
+         context_u128: u128,
+         is_static: bool,
+-        is_evm_interpreter: bool,
++        is_evm_blob_format: bool,
+         world_before_this_frame: Snapshot,
+     ) -> Self {
+         let is_kernel = is_kernel(address);
++        // Mirror zk_evm's stipend rule (zk_evm/src/opcodes/execution/far_call.rs:660-664):
++        // the EVM stipend is granted whenever the deployer-storage entry is in EVM blob
++        // format, regardless of whether the call ultimately masks to the default AA.
+         let heap_size = if is_kernel {
+             NEW_KERNEL_FRAME_MEMORY_STIPEND
+-        } else if is_evm_interpreter {
++        } else if is_evm_blob_format {
+             NEW_EVM_FRAME_MEMORY_STIPEND
+         } else {
+             NEW_FRAME_MEMORY_STIPEND
+--- a/crates/vm2/src/vm.rs
++++ b/crates/vm2/src/vm.rs
+@@ -202,7 +202,7 @@
+         gas: u32,
+         exception_handler: u16,
+         is_static: bool,
+-        is_evm_interpreter: bool,
++        is_evm_blob_format: bool,
+         calldata_heap: HeapId,
+         world_before_this_frame: Snapshot,
+     ) {
+@@ -237,7 +237,7 @@
+                 self.state.context_u128
+             },
+             is_static,
+-            is_evm_interpreter,
++            is_evm_blob_format,
+             world_before_this_frame,
+         );
+         self.state.context_u128 = 0;
+--- a/crates/vm2/src/instruction_handlers/far_call.rs
++++ b/crates/vm2/src/instruction_handlers/far_call.rs
+@@ -100,7 +100,7 @@
+                 return None;
+             }
+             let calldata = maybe_calldata?;
+-            let (unpaid_decommit, is_evm) = decommit_result?;
++            let (unpaid_decommit, is_evm, is_evm_blob_format) = decommit_result?;
+             let code_hash = unpaid_decommit.code_key();
+             let should_materialize = unpaid_decommit.should_materialize();
+             let program = vm.world_diff.pay_for_decommit(
+@@ -119,7 +119,7 @@
+                 materialize_decommit_page(vm, code_hash, &code, code_page_from_base(new_base_page));
+             }
+ 
+-            Some((calldata, program, is_evm))
++            Some((calldata, program, is_evm, is_evm_blob_format))
+         })();
+ 
+         let maximum_gas = vm.state.current_frame.gas / 64 * 63;
+@@ -128,8 +128,8 @@
+         let new_frame_gas = normally_passed_gas + mandated_gas;
+ 
+         // A far call pushes a new frame and returns from it in the next instruction if it panics.
+-        let (calldata, program, is_evm_interpreter) =
+-            fallible_part.unwrap_or_else(|| (U256::zero().into(), Program::new_panicking(), false));
++        let (calldata, program, is_evm_interpreter, is_evm_blob_format) = fallible_part
++            .unwrap_or_else(|| (U256::zero().into(), Program::new_panicking(), false, false));
+ 
+         let new_frame_is_static = IS_STATIC || vm.state.current_frame.is_static;
+         vm.push_frame::<M>(
+@@ -138,7 +138,7 @@
+             new_frame_gas,
+             exception_handler,
+             new_frame_is_static && !is_evm_interpreter,
+-            is_evm_interpreter,
++            is_evm_blob_format,
+             calldata.memory_page,
+             vm.world_diff.snapshot(),
+         );
+--- a/crates/vm2/src/tests/divergence_regressions.rs
++++ b/crates/vm2/src/tests/divergence_regressions.rs
+@@ -2,9 +2,7 @@
+ use zkevm_opcode_defs::{
+     decoding::EncodingModeProduction,
+     ethereum_types::Address,
+-    system_params::{
+-        NEW_EVM_FRAME_MEMORY_STIPEND, NEW_FRAME_MEMORY_STIPEND, VM_MAX_STACK_DEPTH,
+-    },
++    system_params::{NEW_EVM_FRAME_MEMORY_STIPEND, VM_MAX_STACK_DEPTH},
+     Condition, DecodedOpcode, ImmMemHandlerFlags, Opcode, Operand, RegOrImmFlags, UMAOpcode,
+     OPCODES_TABLE, UMA_INCREMENT_FLAG_IDX,
+ };
+@@ -1115,10 +1113,17 @@
+     // holds, vm2 returns the default-AA hash with `is_evm = false`, and the new frame
+     // gets `NEW_FRAME_MEMORY_STIPEND` (4096) instead of 57344.
+     //
+-    // This test asserts vm2's *current* behaviour, locking in the divergence so that
+-    // a future fix (which should align vm2 with zk_evm) will fail this test loudly
+-    // and prompt updating the assertion to `NEW_EVM_FRAME_MEMORY_STIPEND`.
++    // After the fix (decommit.rs / callframe.rs / vm.rs / far_call.rs), vm2 plumbs a
++    // separate `is_evm_blob_format` flag — set whenever `code_info_bytes[0] == 0x02`,
++    // independent of the construction-state mask — through to `Callframe::new`, which
++    // uses it to select the heap stipend. `is_evm_interpreter` keeps its prior meaning
++    // (drives the `is_static && !is_evm_interpreter` rule and the `call_type` encoding
++    // in `far_call.rs`), exactly mirroring zk_evm's split between `code_version_byte`
++    // (stipend) and `call_to_evm_emulator` (static / call_type).
+     //
++    // This test asserts vm2's *post-fix* behaviour: `NEW_EVM_FRAME_MEMORY_STIPEND`
++    // (57344) on the new frame's heap and aux_heap, matching zk_evm.
++    //
+     // Limitations / assumptions:
+     //   * Single-VM test: we only execute the FarCall in vm2, not in zk_evm. The
+     //     reference value (57344) is read from the pinned zk_evm source. A true
+@@ -1203,18 +1208,18 @@
+     // the kernel-stipend short-circuit nor a `try_default_aa = None` path is hit.
+     assert!(!vm.state.current_frame.is_kernel);
+ 
+-    // Divergence point: zk_evm grants NEW_EVM_FRAME_MEMORY_STIPEND (57344) here;
+-    // vm2 grants NEW_FRAME_MEMORY_STIPEND (4096). Locking in vm2's current value.
++    // Post-fix: vm2 grants NEW_EVM_FRAME_MEMORY_STIPEND (57344), matching zk_evm.
++    // If this assertion starts failing because the value is now
++    // NEW_FRAME_MEMORY_STIPEND (4096), the fix has been reverted — restore the
++    // `is_evm_blob_format` plumbing from decommit through Callframe::new.
+     assert_eq!(
+-        vm.state.current_frame.heap_size, NEW_FRAME_MEMORY_STIPEND,
+-        "vm2 currently downgrades the stipend on construction-state default-AA \
+-         mask; zk_evm reference grants {NEW_EVM_FRAME_MEMORY_STIPEND}. \
+-         If this assertion starts failing because the value is now \
+-         {NEW_EVM_FRAME_MEMORY_STIPEND}, the divergence has been fixed — flip \
+-         this test to expect that value.",
++        vm.state.current_frame.heap_size, NEW_EVM_FRAME_MEMORY_STIPEND,
++        "vm2 should grant the EVM stipend whenever the deployer-storage entry's \
++         version byte is 0x02 (BlobSha256Format), independent of the \
++         construction-state mask, matching zk_evm.",
+     );
+     assert_eq!(
+-        vm.state.current_frame.aux_heap_size, NEW_FRAME_MEMORY_STIPEND,
++        vm.state.current_frame.aux_heap_size, NEW_EVM_FRAME_MEMORY_STIPEND,
+         "aux_heap stipend should track the heap stipend",
+     );
+ }
