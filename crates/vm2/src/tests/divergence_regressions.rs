@@ -2,9 +2,7 @@ use primitive_types::{H160, U256};
 use zkevm_opcode_defs::{
     decoding::EncodingModeProduction,
     ethereum_types::Address,
-    system_params::{
-        NEW_EVM_FRAME_MEMORY_STIPEND, NEW_FRAME_MEMORY_STIPEND, VM_MAX_STACK_DEPTH,
-    },
+    system_params::{NEW_EVM_FRAME_MEMORY_STIPEND, VM_MAX_STACK_DEPTH},
     Condition, DecodedOpcode, ImmMemHandlerFlags, Opcode, Operand, RegOrImmFlags, UMAOpcode,
     OPCODES_TABLE, UMA_INCREMENT_FLAG_IDX,
 };
@@ -1115,9 +1113,16 @@ fn far_call_to_unconstructed_evm_downgrades_stipend_versus_zk_evm() {
     // holds, vm2 returns the default-AA hash with `is_evm = false`, and the new frame
     // gets `NEW_FRAME_MEMORY_STIPEND` (4096) instead of 57344.
     //
-    // This test asserts vm2's *current* behaviour, locking in the divergence so that
-    // a future fix (which should align vm2 with zk_evm) will fail this test loudly
-    // and prompt updating the assertion to `NEW_EVM_FRAME_MEMORY_STIPEND`.
+    // After the fix (decommit.rs / callframe.rs / vm.rs / far_call.rs), vm2 plumbs a
+    // separate `is_evm_blob_format` flag — set whenever `code_info_bytes[0] == 0x02`,
+    // independent of the construction-state mask — through to `Callframe::new`, which
+    // uses it to select the heap stipend. `is_evm_interpreter` keeps its prior meaning
+    // (drives the `is_static && !is_evm_interpreter` rule and the `call_type` encoding
+    // in `far_call.rs`), exactly mirroring zk_evm's split between `code_version_byte`
+    // (stipend) and `call_to_evm_emulator` (static / call_type).
+    //
+    // This test asserts vm2's *post-fix* behaviour: `NEW_EVM_FRAME_MEMORY_STIPEND`
+    // (57344) on the new frame's heap and aux_heap, matching zk_evm.
     //
     // Limitations / assumptions:
     //   * Single-VM test: we only execute the FarCall in vm2, not in zk_evm. The
@@ -1203,18 +1208,18 @@ fn far_call_to_unconstructed_evm_downgrades_stipend_versus_zk_evm() {
     // the kernel-stipend short-circuit nor a `try_default_aa = None` path is hit.
     assert!(!vm.state.current_frame.is_kernel);
 
-    // Divergence point: zk_evm grants NEW_EVM_FRAME_MEMORY_STIPEND (57344) here;
-    // vm2 grants NEW_FRAME_MEMORY_STIPEND (4096). Locking in vm2's current value.
+    // Post-fix: vm2 grants NEW_EVM_FRAME_MEMORY_STIPEND (57344), matching zk_evm.
+    // If this assertion starts failing because the value is now
+    // NEW_FRAME_MEMORY_STIPEND (4096), the fix has been reverted — restore the
+    // `is_evm_blob_format` plumbing from decommit through Callframe::new.
     assert_eq!(
-        vm.state.current_frame.heap_size, NEW_FRAME_MEMORY_STIPEND,
-        "vm2 currently downgrades the stipend on construction-state default-AA \
-         mask; zk_evm reference grants {NEW_EVM_FRAME_MEMORY_STIPEND}. \
-         If this assertion starts failing because the value is now \
-         {NEW_EVM_FRAME_MEMORY_STIPEND}, the divergence has been fixed — flip \
-         this test to expect that value.",
+        vm.state.current_frame.heap_size, NEW_EVM_FRAME_MEMORY_STIPEND,
+        "vm2 should grant the EVM stipend whenever the deployer-storage entry's \
+         version byte is 0x02 (BlobSha256Format), independent of the \
+         construction-state mask, matching zk_evm.",
     );
     assert_eq!(
-        vm.state.current_frame.aux_heap_size, NEW_FRAME_MEMORY_STIPEND,
+        vm.state.current_frame.aux_heap_size, NEW_EVM_FRAME_MEMORY_STIPEND,
         "aux_heap stipend should track the heap stipend",
     );
 }

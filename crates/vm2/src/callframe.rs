@@ -72,13 +72,16 @@ impl<T, W> Callframe<T, W> {
         exception_handler: u16,
         context_u128: u128,
         is_static: bool,
-        is_evm_interpreter: bool,
+        is_evm_blob_format: bool,
         world_before_this_frame: Snapshot,
     ) -> Self {
         let is_kernel = is_kernel(address);
+        // Mirror zk_evm's stipend rule (zk_evm/src/opcodes/execution/far_call.rs:660-664):
+        // the EVM stipend is granted whenever the deployer-storage entry is in EVM blob
+        // format, regardless of whether the call ultimately masks to the default AA.
         let heap_size = if is_kernel {
             NEW_KERNEL_FRAME_MEMORY_STIPEND
-        } else if is_evm_interpreter {
+        } else if is_evm_blob_format {
             NEW_EVM_FRAME_MEMORY_STIPEND
         } else {
             NEW_FRAME_MEMORY_STIPEND

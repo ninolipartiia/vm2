@@ -53,11 +53,16 @@ impl WorldDiff {
         evm_interpreter_code_hash: [u8; 32],
         is_constructor_call: bool,
         tx_number_in_block: u16,
-    ) -> Option<(UnpaidDecommit, bool)> {
+    ) -> Option<(UnpaidDecommit, bool, bool)> {
         let deployer_system_contract_address =
             Address::from_low_u64_be(DEPLOYER_SYSTEM_CONTRACT_ADDRESS_LOW.into());
 
         let mut is_evm = false;
+        // Whether the deployer-storage entry is in EVM blob format (`code_version_byte == 0x02`).
+        // Tracked separately from `is_evm` so that the new frame's heap stipend can match
+        // zk_evm, which keys the stipend on the version byte alone — even when the call
+        // ultimately masks to the default AA. See zk_evm/src/opcodes/execution/far_call.rs:660-664.
+        let mut is_evm_blob_format = false;
 
         let mut code_info = {
             let code_info = self.read_storage_without_refund(
@@ -98,6 +103,7 @@ impl WorldDiff {
                     }
                 }
                 2 => {
+                    is_evm_blob_format = true;
                     if is_constructed == is_constructor_call {
                         try_default_aa?
                     } else {
@@ -131,6 +137,7 @@ impl WorldDiff {
                 should_materialize,
             },
             is_evm,
+            is_evm_blob_format,
         ))
     }
 
