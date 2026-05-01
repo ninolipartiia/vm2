@@ -4,7 +4,8 @@ members = [
     "crates/vm2-interface",
     "crates/vm2",
     # Testing crates
-    "tests/afl-fuzz"
+    "tests/afl-fuzz",
+    "tests/differential-regressions",
 ]
 resolver = "2"
 

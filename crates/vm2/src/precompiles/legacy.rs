@@ -155,8 +155,10 @@ impl Precompiles for LegacyPrecompiles {
     }
 }
 
+// `single_instruction_test` swaps in a mocked `Heaps` whose `new(&[])` is
+// `unimplemented!`, which these tests call; mirror the gating in `lib.rs`.
 #[allow(clippy::cast_possible_truncation)] // OK for tests
-#[cfg(test)]
+#[cfg(all(test, not(feature = "single_instruction_test")))]
 mod tests {
     use proptest::{array, collection, num, option, prelude::*};
     use zkevm_opcode_defs::{

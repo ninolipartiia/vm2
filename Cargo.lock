@@ -1859,6 +1859,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zksync_vm2_differential_regressions"
+version = "0.5.0"
+dependencies = [
+ "pretty_assertions",
+ "primitive-types",
+ "zkevm_opcode_defs",
+ "zksync_vm2",
+ "zksync_vm2_interface",
+]
+
+[[package]]
 name = "zksync_vm2_interface"
 version = "0.5.0"
 dependencies = [

@@ -2,7 +2,7 @@ use primitive_types::{H160, U256};
 use zkevm_opcode_defs::{
     decoding::EncodingModeProduction,
     ethereum_types::Address,
-    system_params::{NEW_EVM_FRAME_MEMORY_STIPEND, VM_MAX_STACK_DEPTH},
+    system_params::VM_MAX_STACK_DEPTH,
     Condition, DecodedOpcode, ImmMemHandlerFlags, Opcode, Operand, RegOrImmFlags, UMAOpcode,
     OPCODES_TABLE, UMA_INCREMENT_FLAG_IDX,
 };
@@ -12,7 +12,6 @@ use crate::{
     addressing_modes::{Arguments, Immediate1, Register, Register1, Register2},
     decode::decode,
     fat_pointer::FatPointer,
-    instruction_handlers::address_into_u256,
     page_ids::{
         aux_heap_page_from_base, first_dynamic_base_page, heap_page_from_base, next_page_group,
     },
@@ -1085,143 +1084,6 @@ fn rollback_should_restore_bootloader_heap_after_fresh_decommit() {
 
     vm.rollback();
     assert_eq!(vm.state.heaps[bootloader_heap].read_u256(0), sentinel);
-}
-
-#[test]
-fn far_call_to_unconstructed_evm_downgrades_stipend_versus_zk_evm() {
-    // Regression test for the AFL fuzz crash documented in
-    // `security-review/fuzz-crash-id000000-evm-stipend.md`.
-    //
-    // Setup: a non-kernel caller issues a non-constructor `FarCall<Delegate>` to a
-    // non-kernel destination whose deployer-storage entry has the EVM-blob version
-    // byte (`V[0] == 0x02`) AND the "in construction" marker (`V[1] == 0x01`).
-    //
-    // zk_evm reference behaviour (see zk_evm/src/opcodes/execution/far_call.rs:660-668):
-    //     code_version_byte = V[0];
-    //     // ... `mask_to_default_aa = true` is set later ...
-    //     memory_stipend_userspace = (code_version_byte == BlobSha256Format::VERSION_BYTE)
-    //         ? NEW_EVM_FRAME_MEMORY_STIPEND  // 57344
-    //         : NEW_FRAME_MEMORY_STIPEND;     // 4096
-    // → zk_evm grants `NEW_EVM_FRAME_MEMORY_STIPEND` purely on the version byte,
-    //   independent of the construction-state mask.
-    //
-    // vm2 behaviour (see decommit.rs:60-111 and callframe.rs:78-85): the stipend
-    // is keyed off `is_evm_interpreter`, which is only set in the `code_info_bytes[0] == 2`
-    // branch *and* when `is_constructed != is_constructor_call`. With this storage
-    // value (V[1]=0x01 → is_constructed=false) and an effective is_constructor_call=false
-    // (forced by the `current_frame.is_kernel` mask in far_call.rs:52), the equality
-    // holds, vm2 returns the default-AA hash with `is_evm = false`, and the new frame
-    // gets `NEW_FRAME_MEMORY_STIPEND` (4096) instead of 57344.
-    //
-    // After the fix (decommit.rs / callframe.rs / vm.rs / far_call.rs), vm2 plumbs a
-    // separate `is_evm_blob_format` flag — set whenever `code_info_bytes[0] == 0x02`,
-    // independent of the construction-state mask — through to `Callframe::new`, which
-    // uses it to select the heap stipend. `is_evm_interpreter` keeps its prior meaning
-    // (drives the `is_static && !is_evm_interpreter` rule and the `call_type` encoding
-    // in `far_call.rs`), exactly mirroring zk_evm's split between `code_version_byte`
-    // (stipend) and `call_to_evm_emulator` (static / call_type).
-    //
-    // This test asserts vm2's *post-fix* behaviour: `NEW_EVM_FRAME_MEMORY_STIPEND`
-    // (57344) on the new frame's heap and aux_heap, matching zk_evm.
-    //
-    // Limitations / assumptions:
-    //   * Single-VM test: we only execute the FarCall in vm2, not in zk_evm. The
-    //     reference value (57344) is read from the pinned zk_evm source. A true
-    //     differential test lives in `tests/afl-fuzz` and reproduces the exact
-    //     fuzzer crash via `show_testcase`.
-    //   * `TestWorld` is a thin in-memory world that returns whatever U256 we
-    //     inject for the deployer-storage slot of the destination address. This
-    //     is the same behaviour as the production `World` would exhibit if a real
-    //     contract were mid-construction; the fuzzer's mock storage path does not
-    //     change the divergence — both VMs read the *same* injected value.
-    //   * The destination address is non-kernel and the caller is non-kernel, so
-    //     `is_kernel` cannot short-circuit the stipend choice.
-    //   * Gas is set generously so that decommit payment cannot fail and abort
-    //     the FarCall before the stipend is computed.
-    //   * The injected hash's length-in-words is 0; this is intentional because
-    //     vm2 masks to the default-AA hash before decommitting, so the injected
-    //     hash itself is never decommitted (only its first two bytes drive the
-    //     mask logic).
-
-    // Register a default-AA program in the test world and use its hash as the
-    // configured `default_aa_code_hash` so the post-mask decommit succeeds.
-    let aa_address = Address::from_low_u64_be(0x1234);
-    let aa_program = Program::from_raw(vec![ret_instruction()], vec![]);
-    let mut world = TestWorld::new(&[(aa_address, aa_program)]);
-    let default_aa_hash_u256 = *world
-        .address_to_hash
-        .get(&address_into_u256(aa_address))
-        .expect("default AA hash must exist");
-    let mut default_aa_code_hash = [0u8; 32];
-    default_aa_hash_u256.to_big_endian(&mut default_aa_code_hash);
-
-    // Inject the "EVM bytecode under construction" deployer-storage entry for
-    // the destination address. Bytes: [0x02, 0x01, len_hi=0, len_lo=0, ..., tag].
-    let destination_address = Address::repeat_byte(0x5a); // non-kernel
-    let mut evm_construction_bytes = [0u8; 32];
-    evm_construction_bytes[0] = 0x02; // BlobSha256Format::VERSION_BYTE
-    evm_construction_bytes[1] = 0x01; // in construction
-    evm_construction_bytes[28..].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
-    let evm_construction_hash = U256::from_big_endian(&evm_construction_bytes);
-    world.address_to_hash.insert(
-        address_into_u256(destination_address),
-        evm_construction_hash,
-    );
-
-    let settings = Settings {
-        default_aa_code_hash,
-        evm_interpreter_code_hash: [0u8; 32],
-        hook_address: 0,
-    };
-
-    let far_call = Instruction::from_far_call::<opcodes::Delegate>(
-        Register1(Register::new(1)),
-        Register2(Register::new(2)),
-        Immediate1(1),
-        false, // is_static
-        false, // is_shard
-        Arguments::new(Predicate::Always, 200, ModeRequirements::none()),
-    );
-    let program = Program::from_raw(vec![far_call, ret_instruction()], vec![]);
-
-    let mut vm = VirtualMachine::new(
-        non_kernel_address(),
-        program,
-        Address::zero(),
-        &[],
-        1_000_000_000,
-        settings,
-    );
-
-    let mut far_call_abi = U256::zero();
-    far_call_abi.0[3] = 100_000; // gas to pass
-    vm.state.register_pointer_flags &= !(1 << 1);
-    vm.state.registers[1] = far_call_abi;
-    vm.state.registers[2] = address_into_u256(destination_address);
-
-    execute_one_instruction(&mut vm, &mut world, &mut ());
-
-    // The new frame should be the called frame, with the destination as its code address.
-    assert_eq!(vm.state.current_frame.code_address, destination_address);
-
-    // Sanity: caller is non-kernel and destination is non-kernel, so neither
-    // the kernel-stipend short-circuit nor a `try_default_aa = None` path is hit.
-    assert!(!vm.state.current_frame.is_kernel);
-
-    // Post-fix: vm2 grants NEW_EVM_FRAME_MEMORY_STIPEND (57344), matching zk_evm.
-    // If this assertion starts failing because the value is now
-    // NEW_FRAME_MEMORY_STIPEND (4096), the fix has been reverted — restore the
-    // `is_evm_blob_format` plumbing from decommit through Callframe::new.
-    assert_eq!(
-        vm.state.current_frame.heap_size, NEW_EVM_FRAME_MEMORY_STIPEND,
-        "vm2 should grant the EVM stipend whenever the deployer-storage entry's \
-         version byte is 0x02 (BlobSha256Format), independent of the \
-         construction-state mask, matching zk_evm.",
-    );
-    assert_eq!(
-        vm.state.current_frame.aux_heap_size, NEW_EVM_FRAME_MEMORY_STIPEND,
-        "aux_heap stipend should track the heap stipend",
-    );
 }
 
 #[test]

@@ -12,6 +12,16 @@ pub struct Heap {
     pub(crate) write: Option<(u32, U256)>,
 }
 
+impl Heap {
+    /// An empty heap: every read returns zero, no write recorded.
+    pub fn empty() -> Self {
+        Self {
+            read: MockRead::new([0u8; 32]),
+            write: None,
+        }
+    }
+}
+
 #[allow(clippy::unused_self)] // to align signatures with real implementation
 impl Heap {
     fn write_u256(&mut self, start_address: u32, value: U256) {
@@ -64,6 +74,19 @@ pub struct Heaps {
     #[allow(dead_code)] // For API compatibility with real implementation.
     heap_id: HeapId,
     pub(crate) read: MockRead<HeapId, Heap>,
+}
+
+impl Heaps {
+    /// Empty heaps tagged with the given identifier — all reads return zero.
+    ///
+    /// Used by the differential-regressions test crate to build a deterministic
+    /// initial state without going through `Arbitrary`.
+    pub fn empty(heap_id: HeapId) -> Self {
+        Self {
+            heap_id,
+            read: MockRead::new(Heap::empty()),
+        }
+    }
 }
 
 #[allow(clippy::unused_self)] // to align signatures with real implementation

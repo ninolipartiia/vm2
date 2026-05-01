@@ -1,0 +1,23 @@
+[package]
+name = "zksync_vm2_differential_regressions"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[dependencies]
+zksync_vm2 = { workspace = true, features = ["single_instruction_test"] }
+zksync_vm2_interface.workspace = true
+zkevm_opcode_defs.workspace = true
+primitive-types.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+
+[lints]
+workspace = true

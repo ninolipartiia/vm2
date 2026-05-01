@@ -9,6 +9,7 @@
 
 pub use self::{
     into_zk_evm::{add_heap_to_zk_evm, vm2_to_zk_evm, NoTracer},
+    testkit::{encode_far_call, step_diff, CallframeSetup, SingleInstructionTestSetup},
     universal_state::UniversalVmState,
     world::MockWorld,
 };
@@ -21,6 +22,7 @@ mod print_mock_info;
 pub mod program;
 pub mod stack;
 mod state_to_zk_evm;
+mod testkit;
 mod universal_state;
 mod validation;
 mod vm;

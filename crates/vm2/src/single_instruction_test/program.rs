@@ -68,6 +68,23 @@ impl<T, W> Program<T, W> {
 }
 
 impl<T: Tracer, W: World<T>> Program<T, W> {
+    /// Builds a single-instruction program from the raw 64-bit opcode word.
+    ///
+    /// `raw` is decoded the same way the production VM decodes a fetched code word —
+    /// matching the AFL fuzz harness, which stores `raw_first_instruction` as a `u64`
+    /// and decodes it lazily.
+    pub fn with_raw_first_instruction(raw: u64) -> Self {
+        Self {
+            raw_first_instruction: raw,
+            first_instruction: MockRead::new(Rc::new([
+                decode(raw, false),
+                Instruction::from_invalid(),
+            ])),
+            other_instruction: MockRead::new(Rc::new(None)),
+            code_page: Arc::new([U256::zero(); 1]),
+        }
+    }
+
     pub fn for_decommit() -> Self {
         Self {
             raw_first_instruction: 0,
