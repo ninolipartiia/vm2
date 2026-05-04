@@ -153,6 +153,8 @@ fn far_call_setup(
 /// Pre-fix: vm2 grants `NEW_FRAME_MEMORY_STIPEND` (4096), zk_evm grants
 /// `NEW_EVM_FRAME_MEMORY_STIPEND` (57344) → `UniversalVmState` differs on
 /// `heap_bound` / `aux_heap_bound`. Post-fix: both VMs grant 57344.
+/// 
+/// Should FAIL if the fix has not been applied
 #[test]
 fn far_call_to_unconstructed_evm_grants_evm_stipend_matching_zk_evm() {
     let setup = far_call_setup(
@@ -164,10 +166,8 @@ fn far_call_to_unconstructed_evm_grants_evm_stipend_matching_zk_evm() {
         /* is_constructor   = */ false,
     );
 
-    let mut vm = VirtualMachine::<(), MockWorld>::for_test_single_instruction(
-        setup,
-        default_settings(),
-    );
+    let mut vm =
+        VirtualMachine::<(), MockWorld>::for_test_single_instruction(setup, default_settings());
     let mut world = MockWorld::with_storage_slot(Some(deployer_storage_slot(
         /* version_byte    = */ 0x02,
         /* in_construction = */ true,
@@ -195,10 +195,8 @@ fn far_call_to_constructed_evm_matches_zk_evm() {
         /* is_constructor   = */ false,
     );
 
-    let mut vm = VirtualMachine::<(), MockWorld>::for_test_single_instruction(
-        setup,
-        default_settings(),
-    );
+    let mut vm =
+        VirtualMachine::<(), MockWorld>::for_test_single_instruction(setup, default_settings());
     let mut world = MockWorld::with_storage_slot(Some(deployer_storage_slot(
         /* version_byte    = */ 0x02,
         /* in_construction = */ false,
@@ -222,6 +220,8 @@ fn far_call_to_constructed_evm_matches_zk_evm() {
 /// `is_constructed (true) == is_constructor_call (true)` so vm2 masks to the
 /// default AA. Pre-fix: heap_size = `NEW_FRAME_MEMORY_STIPEND` (4096).
 /// Post-fix and zk_evm: heap_size = `NEW_EVM_FRAME_MEMORY_STIPEND` (57344).
+/// 
+/// Should FAIL if the fix has not been applied
 #[test]
 fn kernel_constructor_call_to_evm_grants_evm_stipend_matching_zk_evm() {
     let setup = far_call_setup(
@@ -233,10 +233,8 @@ fn kernel_constructor_call_to_evm_grants_evm_stipend_matching_zk_evm() {
         /* is_constructor   = */ true,
     );
 
-    let mut vm = VirtualMachine::<(), MockWorld>::for_test_single_instruction(
-        setup,
-        default_settings(),
-    );
+    let mut vm =
+        VirtualMachine::<(), MockWorld>::for_test_single_instruction(setup, default_settings());
     let mut world = MockWorld::with_storage_slot(Some(deployer_storage_slot(
         /* version_byte    = */ 0x02,
         /* in_construction = */ false,
@@ -264,10 +262,8 @@ fn far_call_to_native_eravm_does_not_grant_evm_stipend() {
         /* is_constructor   = */ false,
     );
 
-    let mut vm = VirtualMachine::<(), MockWorld>::for_test_single_instruction(
-        setup,
-        default_settings(),
-    );
+    let mut vm =
+        VirtualMachine::<(), MockWorld>::for_test_single_instruction(setup, default_settings());
     let mut world = MockWorld::with_storage_slot(Some(deployer_storage_slot(
         /* version_byte    = */ 0x01,
         /* in_construction = */ false,
