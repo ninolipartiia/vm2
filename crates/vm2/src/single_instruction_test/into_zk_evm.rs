@@ -35,6 +35,11 @@ pub fn vm2_to_zk_evm<T: Tracer, W: World<T>>(
     let mut event_sink = InMemoryEventSink::new();
     event_sink.start_frame(zk_evm::aux_structures::Timestamp(0));
 
+    // Pre-execution this is `None` (no heap access has happened yet); post-execution
+    // this is populated from vm2's recorded write so the universal-state projection
+    // built from vm2 can be compared against zk_evm's observed write.
+    let heap_write_observed = vm2_recorded_heap_write(vm);
+
     VmState {
         local_state: vm2_state_to_zk_evm_state(&vm.state),
         block_properties: BlockProperties {
@@ -47,7 +52,8 @@ pub fn vm2_to_zk_evm<T: Tracer, W: World<T>>(
             code_page: vm.state.current_frame.program.code_page().clone(),
             stack: *vm.state.current_frame.stack.clone(),
             heap_read: None,
-            heap_write: None,
+            heap_write_expected: None,
+            heap_write_observed,
         },
         event_sink,
         precompiles_processor: NoOracle,
@@ -55,6 +61,18 @@ pub fn vm2_to_zk_evm<T: Tracer, W: World<T>>(
         witness_tracer: NoOracle,
         version: Version::Version27,
     }
+}
+
+fn vm2_recorded_heap_write<T, W>(vm: &VirtualMachine<T, W>) -> Option<ExpectedHeapValue> {
+    let (heapid, heap) = vm.state.heaps.read.read_that_happened()?;
+    let (start_index, value_u256) = heap.write?;
+    let mut value = [0u8; 32];
+    value_u256.to_big_endian(&mut value);
+    Some(ExpectedHeapValue {
+        heap: heapid.as_u32(),
+        start_index,
+        value,
+    })
 }
 
 pub fn add_heap_to_zk_evm<T, W>(
@@ -75,7 +93,7 @@ pub fn add_heap_to_zk_evm<T, W>(
             let mut value = [0; 32];
             value_u256.to_big_endian(&mut value);
 
-            zk_evm.memory.heap_write = Some(ExpectedHeapValue {
+            zk_evm.memory.heap_write_expected = Some(ExpectedHeapValue {
                 heap: heapid.as_u32(),
                 start_index,
                 value,
@@ -89,14 +107,26 @@ pub struct MockMemory {
     code_page: Arc<[U256]>,
     stack: Stack,
     heap_read: Option<ExpectedHeapValue>,
-    heap_write: Option<ExpectedHeapValue>,
+    /// vm2's recorded write, propagated via [`add_heap_to_zk_evm`] before zk_evm
+    /// runs. Used in `execute_partial_query` to fail-fast when zk_evm's write
+    /// disagrees with vm2's.
+    heap_write_expected: Option<ExpectedHeapValue>,
+    /// The write zk_evm actually issued during its cycle. Recorded by
+    /// `execute_partial_query` and surfaced through `UniversalVmState` so the
+    /// post-cycle comparator can also detect "vm2 wrote but zk_evm didn't."
+    ///
+    /// When zk_evm splits a misaligned vm2 write into two word-aligned
+    /// `MemoryQuery`s, the per-query bytes are merged into a single recording
+    /// whose `start_index` matches vm2's, so the structured comparison stays
+    /// byte-exact regardless of zk_evm's word alignment.
+    pub(crate) heap_write_observed: Option<ExpectedHeapValue>,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct ExpectedHeapValue {
-    heap: u32,
-    start_index: u32,
-    value: [u8; 32],
+    pub(crate) heap: u32,
+    pub(crate) start_index: u32,
+    pub(crate) value: [u8; 32],
 }
 
 impl ExpectedHeapValue {
@@ -141,13 +171,37 @@ impl Memory for MockMemory {
             }
             MemoryType::Heap | MemoryType::AuxHeap | MemoryType::FatPointer => {
                 if query.rw_flag {
-                    let heap = self.heap_write.unwrap();
+                    let heap = self.heap_write_expected.unwrap();
                     assert_eq!(heap.heap, query.location.page.0);
 
                     assert_eq!(
                         query.value,
                         heap.partially_overlapping_u256(query.location.index.0 * 32)
                     );
+
+                    // Reconstruct vm2's logical 32-byte write from zk_evm's per-word
+                    // queries. A misaligned vm2 write spans two zk_evm word queries;
+                    // each query overlays its bytes onto the observed value at the
+                    // correct offset relative to vm2's `start_index`. After all queries,
+                    // `heap_write_observed` matches vm2's `(start_index, value)` exactly.
+                    let observed =
+                        self.heap_write_observed.get_or_insert(ExpectedHeapValue {
+                            heap: query.location.page.0,
+                            start_index: heap.start_index,
+                            value: [0u8; 32],
+                        });
+                    let query_byte_start = query.location.index.0 * 32;
+                    let mut query_bytes = [0u8; 32];
+                    query.value.to_big_endian(&mut query_bytes);
+                    for i in 0..32u32 {
+                        let abs_byte = query_byte_start + i;
+                        if abs_byte >= observed.start_index {
+                            let j = abs_byte - observed.start_index;
+                            if j < 32 {
+                                observed.value[j as usize] = query_bytes[i as usize];
+                            }
+                        }
+                    }
                 } else if let Some(heap) = self.heap_read {
                     // ^ Writes read the heap too, but they are just fed zeroes
 

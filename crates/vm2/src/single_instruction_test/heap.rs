@@ -29,11 +29,17 @@ impl Heap {
         self.write = Some((start_address, value));
     }
 
-    fn write_bytes(&mut self, start_address: u32, bytes: &[u8]) {
-        let mut word = [0_u8; 32];
-        let copied = bytes.len().min(word.len());
-        word[..copied].copy_from_slice(&bytes[..copied]);
-        self.write_u256(start_address, U256::from_big_endian(&word));
+    fn write_bytes(&mut self, _start_address: u32, _bytes: &[u8]) {
+        // Intentionally not recorded into `self.write`. The only production caller of
+        // `Heaps::write_bytes` is `materialize_decommit_page`, which writes a callee's
+        // bytecode into a fresh code page during a far call. zk_evm's `MockDecommitter`
+        // is a no-op that never touches memory, so recording on the vm2 side would
+        // make the symmetric heap-write comparator (`UniversalVmState::heap_write`)
+        // diverge against zk_evm's `None`. Decommit-write equivalence is a separate
+        // (currently uncovered) blind spot — see claude_overview/fuzzer_blind_spots.md.
+        //
+        // User-level writes (`HeapWrite` / `AuxHeapWrite` / `PointerWrite` opcodes) all
+        // go through `Heaps::write_u256`, which is unaffected and still records.
     }
 
     pub(crate) fn read_byte(&self, _: u32) -> u8 {
@@ -144,6 +150,14 @@ impl Heaps {
     }
 
     pub(crate) fn rollback(&mut self, _: (usize, usize)) {
+        unimplemented!()
+    }
+
+    pub(crate) fn dynamic_len(&self) -> usize {
+        unimplemented!()
+    }
+
+    pub(crate) fn truncate_dynamic_to(&mut self, _: usize) {
         unimplemented!()
     }
 

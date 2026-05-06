@@ -5,7 +5,7 @@ use zk_evm::{
 };
 use zkevm_opcode_defs::decoding::EncodingModeProduction;
 
-use super::into_zk_evm::{MockDecommitter, MockMemory, MockWorldWrapper, NoOracle};
+use super::into_zk_evm::{ExpectedHeapValue, MockDecommitter, MockMemory, MockWorldWrapper, NoOracle};
 
 #[derive(PartialEq, Debug)]
 pub struct UniversalVmState {
@@ -15,6 +15,11 @@ pub struct UniversalVmState {
     context_u128: u128,
     frames: Vec<UniversalVmFrame>,
     will_panic: bool,
+    /// Heap write that occurred during the cycle, if any. Populated symmetrically
+    /// from the vm2 side (via `vm2_to_zk_evm`) and the zk_evm side (via
+    /// `MockMemory::heap_write_observed`), so a divergence in *which* heap was
+    /// written, *where*, or *what value* surfaces here.
+    heap_write: Option<ExpectedHeapValue>,
 }
 
 #[derive(PartialEq, Debug)]
@@ -59,7 +64,9 @@ impl
             EncodingModeProduction,
         >,
     ) -> Self {
-        zk_evm_state_to_universal(&vm.local_state)
+        let mut state = zk_evm_state_to_universal(&vm.local_state);
+        state.heap_write = vm.memory.heap_write_observed;
+        state
     }
 }
 
@@ -111,6 +118,8 @@ fn zk_evm_state_to_universal(vm: &VmLocalState<8, EncodingModeProduction>) -> Un
         context_u128: vm.context_u128_register,
         frames,
         will_panic: vm.pending_exception,
+        // Filled in by `From<VmState<…>>` since memory access requires the full VmState.
+        heap_write: None,
     }
 }
 
