@@ -9,7 +9,9 @@ use zkevm_opcode_defs::{
 use zksync_vm2_interface::{opcodes, HeapId, Tracer};
 
 use crate::{
-    addressing_modes::{Arguments, Immediate1, Register, Register1, Register2},
+    addressing_modes::{
+        Arguments, CodePage, Immediate1, Register, Register1, Register2, RegisterAndImmediate,
+    },
     decode::decode,
     fat_pointer::FatPointer,
     page_ids::{
@@ -1280,5 +1282,265 @@ fn rollback_should_deallocate_dynamic_decommit_page_pinned_outside_bootloader_fr
     assert!(
         msg.contains("is already allocated"),
         "Panic should be a heap allocation conflict, got: {msg}",
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // step-by-step assertions document the bug as it surfaces
+fn realistic_decommit_rollback_leak_via_validation_chain() {
+    // Higher-fidelity companion to
+    // `rollback_should_deallocate_dynamic_decommit_page_pinned_outside_bootloader_frame`.
+    //
+    // The companion test above pokes the VM directly with `vm.push_frame` /
+    // `vm.pop_frame` to set up the leak. This one drives the same scenario
+    // entirely through real opcodes (`FarCall`, `Decommit`, `Add`, `Ret`),
+    // matching the production trigger from
+    // `security-review/decommit-rollback-leak.md`: bootloader → validation →
+    // a kernel contract that runs `Decommit` (e.g. Code Oracle).
+    //
+    // Why depth-2 is required to reproduce the bug through opcodes
+    // -----------------------------------------------------------
+    // A single-frame chain (bootloader → kernel callee) does NOT reproduce the
+    // bug. When the callee `Ret`s with the standard `Register1(Register::new(0))`
+    // operand, `naked_ret` calls `get_calldata(0, …)` which synthesises a fresh
+    // fat pointer to `current_frame.heap`. That heap (= the orphan) is then
+    // forwarded as `heap_to_keep` into `pop_frame`, which `extend`s the
+    // *bootloader's* `heaps_i_am_keeping_alive` with it. On `vm.rollback()`
+    // the bootloader's keep-alive list is drained and the orphan is freed.
+    //
+    // Inserting a `validation` frame between bootloader and decommitter breaks
+    // the propagation: the decommitter's `Ret` pointer ends up in
+    // *validation's* keep-alive, but when validation itself Rets, its
+    // `heap_to_keep` is its own heap (V+2) — not the decommitter's heap.
+    // Validation's keep-alive (which had the orphan) is iterated for
+    // deallocation in `pop_frame`, but the orphan is still pinned at that
+    // point and is skipped. After the swap, validation's keep-alive list is
+    // discarded with the popped frame; only `heap_to_keep` (= V+2) is
+    // appended to bootloader's keep-alive. The orphan is now referenced by
+    // no `heaps_i_am_keeping_alive` list anywhere, exactly as the security
+    // review describes. On `vm.rollback()` the orphan is missed and persists
+    // in `state.heaps.dynamic`. Replay then panics inside validation's own
+    // FarCall handler, when `push_frame` calls `allocate_at(orphan)`.
+    //
+    // Register propagation across two FarCalls
+    // ----------------------------------------
+    // Both FarCalls set `is_system_call = true`, which preserves r3..r12 into
+    // the callee (see `far_call.rs:148-160`). r1 is always overwritten with
+    // the calldata pointer; r2 is overwritten with the call-type byte. We use
+    // r3 to carry `fresh_code_hash` two levels deep. Validation must rebuild
+    // its own r1/r2 from code-page constants before issuing its FarCall.
+    //
+    // This test locks in vm2's *current* (buggy) behaviour. When the leak is
+    // fixed (e.g. by sweeping `state.heaps.dynamic` in `State::rollback`),
+    // the `orphan_persists_post_rollback` assertion or the panic-catch will
+    // start failing — flip the assertions then.
+
+    let validation_address = Address::from_low_u64_be(2);
+    let decommitter_address = Address::from_low_u64_be(3);
+    let fresh_target_address = Address::from_low_u64_be(4);
+
+    let system_call_bit_within_settings: u64 = 1 << 24;
+
+    // ABI validation will load into r1 for its FarCall to the decommitter.
+    let mut nested_abi = U256::zero();
+    nested_abi.0[3] = u64::from(1_000_000_u32) | (system_call_bit_within_settings << 32);
+
+    // Validation reloads r1/r2 from its code page (the bootloader's FarCall
+    // overwrote them with calldata pointer + call-type byte), then FarCalls
+    // the decommitter. Its own `Ret` reads r0, so the synthesised return
+    // pointer points at validation.heap (V+2) — NOT at the orphan.
+    let validation_program = Program::from_raw(
+        vec![
+            // r1 = code_page[0]   (FarCall ABI for the call to the decommitter)
+            Instruction::from_add(
+                CodePage(RegisterAndImmediate {
+                    immediate: 0,
+                    register: Register::new(0),
+                })
+                .into(),
+                Register2(Register::new(0)),
+                Register1(Register::new(1)).into(),
+                Arguments::new(Predicate::Always, 6, ModeRequirements::none()),
+                false,
+                false,
+            ),
+            // r2 = code_page[1]   (decommitter address as U256)
+            Instruction::from_add(
+                CodePage(RegisterAndImmediate {
+                    immediate: 1,
+                    register: Register::new(0),
+                })
+                .into(),
+                Register2(Register::new(0)),
+                Register1(Register::new(2)).into(),
+                Arguments::new(Predicate::Always, 6, ModeRequirements::none()),
+                false,
+                false,
+            ),
+            Instruction::from_far_call::<opcodes::Normal>(
+                Register1(Register::new(1)),
+                Register2(Register::new(2)),
+                Immediate1(0),
+                /* is_static = */ false,
+                /* is_shard  = */ false,
+                Arguments::new(Predicate::Always, 200, ModeRequirements::none()),
+            ),
+            ret_instruction(),
+        ],
+        vec![nested_abi, U256::from(decommitter_address.to_low_u64_be())],
+    );
+
+    // Decommitter reads r3 (fresh_code_hash, preserved across both FarCalls
+    // via the system-call ABI bit) and `Decommit`s on it. The materialised
+    // heap is the decommitter frame's own heap — that's the leak's
+    // precondition.
+    let decommitter_program = Program::from_raw(
+        vec![
+            Instruction::from_decommit(
+                Register1(Register::new(3)),
+                Register2(Register::new(2)),
+                Register1(Register::new(4)),
+                Arguments::new(Predicate::Always, 5, ModeRequirements::none()),
+            ),
+            ret_instruction(),
+        ],
+        vec![],
+    );
+
+    // Fresh target is never executed; it exists only so `TestWorld` produces
+    // a valid `ContractCodeSha256Format` hash that `Decommit` accepts.
+    let fresh_target_program =
+        Program::from_raw(vec![ret_instruction()], vec![U256::from(0xfeed_u64)]);
+
+    let mut world = TestWorld::new(&[
+        (validation_address, validation_program),
+        (decommitter_address, decommitter_program),
+        (fresh_target_address, fresh_target_program),
+    ]);
+    let fresh_code_hash = *world
+        .address_to_hash
+        .get(&U256::from(fresh_target_address.to_low_u64_be()))
+        .expect("fresh-target hash must exist");
+
+    let bootloader_program = Program::from_raw(
+        vec![
+            Instruction::from_far_call::<opcodes::Normal>(
+                Register1(Register::new(1)),
+                Register2(Register::new(2)),
+                Immediate1(0),
+                false,
+                false,
+                Arguments::new(Predicate::Always, 200, ModeRequirements::none()),
+            ),
+            ret_instruction(),
+        ],
+        vec![],
+    );
+
+    let mut vm = VirtualMachine::new(
+        kernel_address(),
+        bootloader_program,
+        Address::zero(),
+        &[],
+        10_000_000,
+        default_settings(),
+    );
+
+    let mut top_abi = U256::zero();
+    top_abi.0[3] = u64::from(5_000_000_u32) | (system_call_bit_within_settings << 32);
+
+    vm.state.registers[1] = top_abi;
+    vm.state.register_pointer_flags &= !(1 << 1);
+    vm.state.registers[2] = U256::from(validation_address.to_low_u64_be());
+    vm.state.registers[3] = fresh_code_hash;
+
+    // Step 1: snapshot in the bootloader frame, before any opcode runs.
+    vm.make_snapshot();
+
+    // Step 2: run the bootloader → validation → decommitter chain to
+    // completion. After this:
+    //   * The decommitter's `Decommit` pinned its own heap globally.
+    //   * The decommitter's `Ret` propagated that heap into validation's
+    //     keep-alive (transient).
+    //   * Validation's `Ret` synthesised a pointer to its OWN heap; the
+    //     orphan is iterated under pin-skip in `pop_frame`, then discarded
+    //     with validation's frame on swap.
+    //   * Bootloader's `Ret` terminated execution.
+    let end = vm.run(&mut world, &mut ());
+    assert!(
+        matches!(end, ExecutionEnd::ProgramFinished(_)),
+        "first run should finish cleanly: {end:?}",
+    );
+
+    // Bootloader's FarCall reserves base = STARTING_BASE_PAGE; validation's
+    // FarCall reserves the next group; the orphan is the decommitter's heap.
+    let decommitter_base = next_page_group(first_dynamic_base_page());
+    let expected_orphan = heap_page_from_base(decommitter_base);
+
+    let orphan_heap = vm
+        .world_diff
+        .decommit_page(fresh_code_hash)
+        .expect("Decommit should have materialised the fresh code page");
+    assert_eq!(
+        orphan_heap, expected_orphan,
+        "orphan should be the decommitter frame's dynamic heap (decommitter_base + 2)",
+    );
+    assert!(
+        vm.world_diff.is_decommit_page_pinned(orphan_heap),
+        "Decommit pinned the page globally; nothing un-pins it before host rollback",
+    );
+    assert!(
+        vm.state.heaps.contains(orphan_heap),
+        "the pinned page must survive both pops",
+    );
+    assert!(
+        !vm.state
+            .current_frame
+            .heaps_i_am_keeping_alive
+            .contains(&orphan_heap),
+        "depth-2 chain dropped the orphan from any keep-alive list — \
+         validation.keep_alive held it briefly, then was discarded on swap",
+    );
+
+    // Step 3: host rollback. `external_rollback` un-pins the orphan;
+    // `state.rollback` rewinds `next_base_page` and drains bootloader's
+    // keep-alive (which holds validation.heap, NOT the orphan) — neither
+    // sweeps `state.heaps.dynamic`.
+    vm.rollback();
+    assert!(
+        !vm.world_diff.is_decommit_page_pinned(orphan_heap),
+        "external_rollback must revert the pin",
+    );
+    let orphan_persists_post_rollback = vm.state.heaps.contains(orphan_heap);
+    assert!(
+        orphan_persists_post_rollback,
+        "vm2 currently leaks the dynamic decommit page across rollback. \
+         If this assertion fires because the page WAS deallocated, the bug \
+         has been fixed — flip this assertion to expect the page is gone.",
+    );
+
+    // Step 4: replay. The bootloader's FarCall succeeds (validation's heap
+    // was deallocated when validation Ret'd). Validation's FarCall to the
+    // decommitter then re-derives the orphan's base page; `push_frame` calls
+    // `Heaps::allocate_at(orphan_heap)` and panics.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vm.run(&mut world, &mut ());
+    }));
+    std::panic::set_hook(prev_hook);
+
+    let err = result.expect_err(
+        "Replaying the chain must panic when validation's FarCall re-allocates \
+         the decommitter base page. If the run succeeded, the leak has been fixed.",
+    );
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    assert!(
+        msg.contains("is already allocated"),
+        "Panic should be a heap-slot allocation conflict, got: {msg}",
     );
 }
