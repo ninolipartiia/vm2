@@ -380,6 +380,36 @@ impl Heaps {
         heap.recycle(&mut self.pagepool);
     }
 
+    pub(crate) fn dynamic_len(&self) -> usize {
+        self.dynamic.len()
+    }
+
+    /// Truncates `dynamic` to `saved_len`, recycling drained heaps.
+    ///
+    /// Used during snapshot rollback to sweep dynamic pages added after the snapshot but
+    /// never registered in any frame's `heaps_i_am_keeping_alive` — notably decommit pages
+    /// materialized into the calling frame's own heap, which the global pin keeps alive past
+    /// frame return.
+    pub(crate) fn truncate_dynamic_to(&mut self, saved_len: usize) {
+        if saved_len >= self.dynamic.len() {
+            return;
+        }
+        let Self {
+            dynamic, pagepool, ..
+        } = self;
+        for group in dynamic.drain(saved_len..) {
+            if let Some(heap) = group.code {
+                heap.recycle(pagepool);
+            }
+            if let Some(heap) = group.heap {
+                heap.recycle(pagepool);
+            }
+            if let Some(heap) = group.aux {
+                heap.recycle(pagepool);
+            }
+        }
+    }
+
     pub(crate) fn write_u256(&mut self, page: HeapId, start_address: u32, value: U256) {
         self.record_bootloader_word_rollback(page, start_address);
         let decoded = DecodedPage::decode(page)
