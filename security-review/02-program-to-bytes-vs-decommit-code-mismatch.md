@@ -1,85 +1,70 @@
-# Vuln 2: API Hygiene — `program_to_bytes` Round-Trip vs `World::decommit_code`
+## Vuln 2: API Hygiene — `program_to_bytes` Round-Trip vs `World::decommit_code`
 
 **Files:**
 - [crates/vm2/src/instruction_handlers/far_call.rs:113-120](../crates/vm2/src/instruction_handlers/far_call.rs#L113-L120)
 - [crates/vm2/src/instruction_handlers/far_call.rs:194-203](../crates/vm2/src/instruction_handlers/far_call.rs#L194-L203)
 - [crates/vm2/src/instruction_handlers/decommit.rs:34-46](../crates/vm2/src/instruction_handlers/decommit.rs#L34-L46)
 
-* **Severity:** LOW (informational / hardening)
+* **Severity:** INFORMATIONAL (hardening)
 * **Category:** api_contract / decommit_bytecode_loading
 * **Confidence:** 3/10
 
 ## Description
 
-The far-call handler materializes the callee's decommit page by re-encoding
-`Program::code_page()` back into raw bytes via `program_to_bytes` (a naive
-32-byte big-endian dump of each `U256`). The standalone `Decommit` opcode
-instead calls `World::decommit_code(hash)` separately.
+The same code hash can be materialized to a heap page via two paths that
+source bytes differently:
 
-The `World` trait places no enforced constraint that
-`program_to_bytes(world.decommit(hash)) == world.decommit_code(hash)`; the
-in-tree TODO comment at far_call.rs:114-117 explicitly acknowledges this
-awkwardness.
+- **Far call:** `program_to_bytes(world.decommit(hash))` — re-encodes the
+  parsed `Program::code_page()` (a `Vec<U256>`) by dumping each word as
+  32 big-endian bytes.
+- **`Decommit` opcode:** `world.decommit_code(hash)` — returns raw bytes
+  directly.
 
-`Program::new` uses `chunks_exact(32)`, silently dropping any tail bytes
-whose length is not a multiple of 32, and `Program::from_words` /
-`Program::from_raw` decouple `code_page` from any raw bytes entirely. In
-principle, a divergence between the two paths produces a code-page whose
-contents disagree with what `Decommit` would observe for the same hash
-(since `set_decommit_page` keys on `code_hash` and the first materializer
-wins).
+`materialize_decommit_page` is keyed on `code_hash` and short-circuits on
+the second call ([decommit.rs:24-26](../crates/vm2/src/decommit.rs#L24-L26)),
+so whichever path runs first wins. If the two paths disagree byte-for-byte,
+the heap contents observed for a given hash become call-order dependent.
+The TODO at far_call.rs:114-117 explicitly flags the awkwardness.
 
-## Why this is not exploitable as written
+## Why this is informational, not exploitable
 
-1. **Bytecode formats are 32-byte aligned by spec.** Both
-   `ContractCodeSha256Format` (EraVM) and `BlobSha256Format` (EVM blob
-   `0x02`) require 32-byte aligned bytecode and are validated upstream
-   ([decommit.rs:30-31](../crates/vm2/src/instruction_handlers/decommit.rs#L30-L31)).
-   Under that invariant `program_to_bytes(Program::new(bytes))` is the
-   identity function — the `chunks_exact(32)` tail-dropping never fires.
-
-2. **The code page is not used for execution.** Execution dispatches from
+1. **No execution-path consequence.** Instructions dispatch from
    `program.instructions` (already parsed); the `CodePage` addressing mode
-   ([addressing_modes.rs:459-468](../crates/vm2/src/addressing_modes.rs#L459-L468))
-   reads `program.code_page()` (the in-memory `Vec<U256>`), not the
-   materialized heap bytes. The materialized bytes are observable only via
-   the fat pointer returned by the `Decommit` opcode, which narrows the
-   blast radius substantially.
+   reads `program.code_page()` directly, not the heap. The materialized
+   bytes are only observable through the fat pointer returned by the
+   `Decommit` opcode.
 
-3. **Sequencer-vs-prover framing is off.** Both run the same `World`
-   implementation in vm2's deployment context; a buggy impl would produce a
-   self-consistent wrong answer, not a divergence. True sequencer/prover
-   divergence requires the prover's bytecode loader (zk_evm) to disagree
-   with vm2 — which is a separate question this report does not establish.
+2. **Bytecode is 32-byte aligned by spec.** Both `ContractCodeSha256Format`
+   and `BlobSha256Format` require alignment, enforced at bytecode
+   publication. Under that invariant `program_to_bytes ∘ Program::new` is
+   the identity, so the `chunks_exact(32)` tail-drop in `Program::new`
+   never fires for any hash a real deployer can produce. Far-call itself
+   gates on `code_info_bytes[0] ∈ {1,2}` from deployer storage rather
+   than re-validating, so the alignment guarantee is structural, not
+   runtime-checked.
 
-4. **The in-tree `World` impls do not diverge.** `TestWorld::decommit_code`
-   derives its bytes from `decommit().code_page()`
-   ([testonly.rs:67-77](../crates/vm2/src/testonly.rs#L67-L77)) and is
-   trivially consistent. No concrete real-world implementation with a
-   divergence is identified.
+3. **No in-tree `World` impl diverges.** `TestWorld::decommit_code`
+   ([testonly.rs:67-77](../crates/vm2/src/testonly.rs#L67-L77)) derives
+   bytes from `decommit().code_page()`, making the round-trip trivially
+   consistent.
+
+4. **Not a vm2/zk_evm divergence.** Both paths run the same `World` impl
+   in any given deployment; a buggy impl produces a self-consistent wrong
+   answer, not a per-VM split.
 
 ## Residual concern
 
-This is an API-hygiene smell rather than a vulnerability:
-
-- The trait silently makes consistency the implementer's responsibility
-  with no docstring or test enforcing it.
-- A future EVM-blob-aware `World` implementation that stored raw bytes
-  with any wrapper / non-aligned tail and forgot to normalize one of the
-  two methods would silently materialize different bytes depending on
-  call order.
+The `World` trait silently makes round-trip consistency the implementer's
+responsibility — no docstring, no test enforces it. A future EVM-blob-aware
+or wrapper-storing `World` that normalized one method but not the other
+would produce call-order-dependent heap contents for the same hash.
 
 ## Recommendation
 
-Add a debug-mode equality assertion between
-`program_to_bytes(&program)` and `world.decommit_code(hash)` in the
-far-call materialization path, and exercise it across all in-tree `World`
-implementations in CI. Optionally, tighten the `World` trait docstrings
-to state that the two methods must agree byte-for-byte after the
-`program_to_bytes` round-trip.
-
-A more invasive fix — having `Program` carry the canonical raw bytes
-alongside the parsed instructions, or routing far-call through
-`World::decommit_code` and parsing on the VM side — would eliminate the
-dual-source design entirely, but is not required to address the
-exploitability concern.
+Document the invariant on the `World` trait
+(`program_to_bytes(decommit(h)) == decommit_code(h)`) and add a debug
+assertion in the far-call materialization path, exercised across in-tree
+`World` impls in CI. A more invasive fix — having `Program` carry the
+canonical raw bytes, or routing far-call through `decommit_code` and
+parsing VM-side — would eliminate the dual-source design but is not
+required.

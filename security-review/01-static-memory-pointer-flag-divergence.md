@@ -21,8 +21,7 @@ StaticMemoryRead — see `zk_evm/src/opcodes/execution/uma.rs:410`:
 The same defect also exists in vm2's regular `load` for HeapRead/AuxHeapRead
 at lines 71-102, broadening the scope. Because StaticMemoryRead is kernel-only
 and is invoked from system/protocol code, any divergence here is
-consensus-relevant and will be observed when the prover's zk_evm replay
-disagrees with vm2's sequencer trace.
+consensus-relevant and will be observed when vm2 disagrees with zk_evm.
 
 ## Exploit Scenario
 
@@ -33,7 +32,7 @@ the pointer flag cleared; zk_evm produces the same numeric value but with the
 pointer flag set. Any downstream operation that branches on the pointer flag
 (FarCall ABI parsing, `FatPointerRead`, `Ptr*` validation) then takes a
 different path on the two implementations, producing a state-transition
-output mismatch between sequencer and prover.
+output mismatch between vm2 and zk_evm.
 
 ## Recommendation
 
@@ -102,7 +101,7 @@ The concrete reachable path is **a panicking `Ret` from a far call**:
 
 ### Severity reassessment
 
-MEDIUM is defensible. The impact is sequencer/prover trace divergence — a
+MEDIUM is defensible. The impact is vm2/zk_evm trace divergence — a
 consensus halt risk rather than state theft. Trigger requires a contrived
 but achievable sequence (panicking callee → caller's exception handler runs
 HeapRead+INCREMENT → flag-sensitive op). MEDIUM-HIGH is also defensible
