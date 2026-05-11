@@ -9,7 +9,7 @@
 
 pub use self::{
     into_zk_evm::{add_heap_to_zk_evm, vm2_to_zk_evm, NoTracer},
-    testkit::{encode_far_call, step_diff, CallframeSetup, SingleInstructionTestSetup},
+    testkit::{encode_far_call, encode_uma, step_diff, CallframeSetup, SingleInstructionTestSetup},
     universal_state::UniversalVmState,
     world::MockWorld,
 };

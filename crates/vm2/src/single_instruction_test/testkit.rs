@@ -13,8 +13,8 @@ use primitive_types::{H160, U256};
 use zksync_vm2_interface::{HeapId, Tracer};
 use zkevm_opcode_defs::{
     decoding::{EncodingModeProduction, VmEncodingMode},
-    Condition, DecodedOpcode, FarCallOpcode, Opcode, OpcodeVariant, Operand,
-    FAR_CALL_SHARD_FLAG_IDX, FAR_CALL_STATIC_FLAG_IDX,
+    Condition, DecodedOpcode, FarCallOpcode, Opcode, OpcodeVariant, Operand, RegOrImmFlags,
+    UMAOpcode, FAR_CALL_SHARD_FLAG_IDX, FAR_CALL_STATIC_FLAG_IDX, UMA_INCREMENT_FLAG_IDX,
 };
 
 use super::{
@@ -207,6 +207,51 @@ pub fn encode_far_call(
         dst0_reg_idx: 0,
         dst1_reg_idx: 0,
         imm_0: exception_handler,
+        imm_1: 0,
+    };
+    EncodingModeProduction::encode_as_integer(&opcode)
+}
+
+/// Encodes a UMA opcode word (`u64`) suitable for
+/// [`Program::with_raw_first_instruction`].
+///
+/// Mirrors [`encode_far_call`] but for unified memory access opcodes
+/// (HeapRead / AuxHeapRead / StaticMemoryRead and their write counterparts).
+/// The canonical src0/dst0 operand types come from
+/// `UMAOpcode::input_operands` / `output_operands` for ISA v1/v2: src0 is
+/// always `RegOrImm(UseRegOnly)` and dst0 is `RegOnly`.
+///
+/// For reads, `dst0_reg_idx` is the destination of the loaded value and
+/// `dst1_reg_idx` receives the incremented offset (when `increment = true`).
+/// For writes, `src1_reg_idx` is the value-to-write and `dst0_reg_idx`
+/// receives the incremented offset (when `increment = true`); writes have
+/// no dst1.
+#[must_use]
+pub fn encode_uma(
+    kind: UMAOpcode,
+    src0_reg_idx: u8,
+    src1_reg_idx: u8,
+    dst0_reg_idx: u8,
+    dst1_reg_idx: u8,
+    increment: bool,
+    condition: Condition,
+) -> u64 {
+    let mut flags = [false; 2];
+    flags[UMA_INCREMENT_FLAG_IDX] = increment;
+
+    let opcode = DecodedOpcode::<8, EncodingModeProduction> {
+        variant: OpcodeVariant {
+            opcode: Opcode::UMA(kind),
+            src0_operand_type: Operand::RegOrImm(RegOrImmFlags::UseRegOnly),
+            dst0_operand_type: Operand::RegOnly,
+            flags,
+        },
+        condition,
+        src0_reg_idx,
+        src1_reg_idx,
+        dst0_reg_idx,
+        dst1_reg_idx,
+        imm_0: 0,
         imm_1: 0,
     };
     EncodingModeProduction::encode_as_integer(&opcode)
