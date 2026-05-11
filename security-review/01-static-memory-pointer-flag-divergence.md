@@ -34,7 +34,7 @@ FatPointerRead is unaffected: vm2's `load_pointer` at [heap_access.rs:192](../cr
 
 Writes (HeapWrite / AuxHeapWrite / StaticMemoryWrite) converge: vm2's `store` ([heap_access.rs:138](../crates/vm2/src/instruction_handlers/heap_access.rs#L138)) and `store_static` ([heap_access.rs:248](../crates/vm2/src/instruction_handlers/heap_access.rs#L248)) clear the flag on dst0; zk_evm's write branch at `uma.rs:471-480` writes `is_pointer: false` and `debug_assert_eq!(src0_is_ptr, false)`.
 
-## Exploit Scenario
+## Exploit Scenario (TBC)
 
 The bug fires only when src0 has `is_pointer = true` **and** `value ≤ LAST_ADDRESS` — otherwise `bigger_than_last_address` panics in both VMs. The one path that produces such a register is a panicking `Ret` from a far call:
 

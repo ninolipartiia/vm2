@@ -76,7 +76,7 @@ fn load<T: Tracer, W: World<T>, H: HeapFromState, In: Source, const INCREMENT: b
     boilerplate::<H::Read, _, _>(vm, world, tracer, |vm, args| {
         // Pointers need not be masked here even though we do not care about them being pointers.
         // They will panic, though because they are larger than 2^32.
-        let (pointer, _) = In::get_with_pointer_flag(args, &mut vm.state);
+        let (pointer, input_is_pointer) = In::get_with_pointer_flag(args, &mut vm.state);
 
         if bigger_than_last_address(pointer) {
             let _ = vm.state.use_gas(u32::MAX);
@@ -96,7 +96,14 @@ fn load<T: Tracer, W: World<T>, H: HeapFromState, In: Source, const INCREMENT: b
         Register1::set(args, &mut vm.state, value);
 
         if INCREMENT {
-            Register2::set(args, &mut vm.state, pointer + 32);
+            // Mirror zk_evm's `is_pointer: src0_is_ptr` on the dst1 update
+            // (uma.rs:404-413). Unconditional `set` would diverge when src0
+            // carries the pointer flag (e.g. r1 after a panicking far-call Ret).
+            if input_is_pointer {
+                Register2::set_fat_ptr(args, &mut vm.state, pointer + 32);
+            } else {
+                Register2::set(args, &mut vm.state, pointer + 32);
+            }
         }
     })
 }
@@ -202,7 +209,7 @@ fn load_static<T: Tracer, W: World<T>, In: Source, const INCREMENT: bool>(
     boilerplate::<opcodes::StaticMemoryRead, _, _>(vm, world, tracer, |vm, args| {
         // Static memory uses a plain 32-bit offset in src0, same as heap UMA ops.
         // Pointer-typed values are still accepted as raw words and then validated by range check.
-        let (pointer, _) = In::get_with_pointer_flag(args, &mut vm.state);
+        let (pointer, input_is_pointer) = In::get_with_pointer_flag(args, &mut vm.state);
 
         if bigger_than_last_address(pointer) {
             vm.state.current_frame.pc = spontaneous_panic();
@@ -214,7 +221,13 @@ fn load_static<T: Tracer, W: World<T>, In: Source, const INCREMENT: bool>(
         Register1::set(args, &mut vm.state, value);
 
         if INCREMENT {
-            Register2::set(args, &mut vm.state, pointer + 32);
+            // Mirror zk_evm's `is_pointer: src0_is_ptr` on the dst1 update
+            // (uma.rs:404-413). Same fix as `load` above.
+            if input_is_pointer {
+                Register2::set_fat_ptr(args, &mut vm.state, pointer + 32);
+            } else {
+                Register2::set(args, &mut vm.state, pointer + 32);
+            }
         }
     })
 }
