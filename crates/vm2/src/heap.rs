@@ -1,6 +1,7 @@
 use std::{
     fmt,
     ops::{Index, Range},
+    sync::OnceLock,
 };
 
 use primitive_types::U256;
@@ -502,11 +503,6 @@ impl Heaps {
         }
     }
 
-    fn decoded_page(&self, page: DecodedPage) -> &Heap {
-        self.try_decoded_page(page)
-            .unwrap_or_else(|| panic!("decoded page {page:?} is not allocated"))
-    }
-
     fn try_decoded_page_mut(&mut self, page: DecodedPage) -> Option<(&mut Heap, &mut PagePool)> {
         let Self {
             static_memory,
@@ -531,13 +527,27 @@ impl Heaps {
     }
 }
 
+/// Read-only fallback used when [`Heaps::index`] encounters an undecodable or
+/// unallocated `HeapId`. Matches `zk_evm`'s behaviour of reading zeros from
+/// missing pages instead of crashing the host (see
+/// `reference_impls/memory.rs:110-115` in `zk_evm`).
+fn empty_heap() -> &'static Heap {
+    static EMPTY_HEAP: OnceLock<Heap> = OnceLock::new();
+    EMPTY_HEAP.get_or_init(Heap::default)
+}
+
 impl Index<HeapId> for Heaps {
     type Output = Heap;
 
+    // Total over `HeapId` on purpose: a user-controllable `FatPointer` can carry
+    // an undecodable id (e.g. the synthetic `HeapId(0)` minted by a failed
+    // far_call) and reach this indexing through `PointerRead`. Panicking here
+    // would abort the host. Returning an empty heap preserves the read-zeros
+    // semantics that zk_evm provides and that downstream code already assumes.
     fn index(&self, index: HeapId) -> &Self::Output {
-        let decoded = DecodedPage::decode(index)
-            .unwrap_or_else(|| panic!("heap page {} is not allocated", index.as_u32()));
-        self.decoded_page(decoded)
+        DecodedPage::decode(index)
+            .and_then(|decoded| self.try_decoded_page(decoded))
+            .unwrap_or_else(|| empty_heap())
     }
 }
 
