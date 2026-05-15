@@ -10,12 +10,12 @@
 //! and [`step_diff`] to build a self-contained vm2-vs-zk_evm regression.
 
 use primitive_types::{H160, U256};
-use zksync_vm2_interface::{HeapId, Tracer};
 use zkevm_opcode_defs::{
     decoding::{EncodingModeProduction, VmEncodingMode},
     Condition, DecodedOpcode, FarCallOpcode, Opcode, OpcodeVariant, Operand, RegOrImmFlags,
     UMAOpcode, FAR_CALL_SHARD_FLAG_IDX, FAR_CALL_STATIC_FLAG_IDX, UMA_INCREMENT_FLAG_IDX,
 };
+use zksync_vm2_interface::{HeapId, Tracer};
 
 use super::{
     into_zk_evm::{add_heap_to_zk_evm, vm2_to_zk_evm, NoTracer},
@@ -23,13 +23,8 @@ use super::{
     MockWorld,
 };
 use crate::{
-    callframe::Callframe,
-    decommit::is_kernel,
-    predication::Flags,
-    program::Program,
-    stack::StackPool,
-    state::State,
-    Settings, VirtualMachine, World, WorldDiff,
+    callframe::Callframe, decommit::is_kernel, predication::Flags, program::Program,
+    stack::StackPool, state::State, Settings, VirtualMachine, World, WorldDiff,
 };
 
 /// Initial state of the current call frame for a single-instruction test.
@@ -103,7 +98,12 @@ impl<T: Tracer, W: World<T>> VirtualMachine<T, W> {
 
         let program = Program::with_raw_first_instruction(current_frame.raw_instruction);
 
-        let frame = Callframe::for_test_single_instruction(current_frame, program, &mut stack_pool, world_diff.snapshot());
+        let frame = Callframe::for_test_single_instruction(
+            current_frame,
+            program,
+            &mut stack_pool,
+            world_diff.snapshot(),
+        );
 
         let state = State::for_test_single_instruction(
             frame,
@@ -316,4 +316,3 @@ impl<T: Tracer, W: World<T>> State<T, W> {
         }
     }
 }
-

@@ -187,12 +187,11 @@ impl Memory for MockMemory {
                     // each query overlays its bytes onto the observed value at the
                     // correct offset relative to vm2's `start_index`. After all queries,
                     // `heap_write_observed` matches vm2's `(start_index, value)` exactly.
-                    let observed =
-                        self.heap_write_observed.get_or_insert(ExpectedHeapValue {
-                            heap: query.location.page.0,
-                            start_index: heap.start_index,
-                            value: [0u8; 32],
-                        });
+                    let observed = self.heap_write_observed.get_or_insert(ExpectedHeapValue {
+                        heap: query.location.page.0,
+                        start_index: heap.start_index,
+                        value: [0u8; 32],
+                    });
                     let query_byte_start = query.location.index.0 * 32;
                     let mut query_bytes = [0u8; 32];
                     query.value.to_big_endian(&mut query_bytes);

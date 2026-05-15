@@ -1,6 +1,7 @@
 //! Low-level VM tests.
 
 mod bytecode_behaviour;
+mod clear_transient_storage_rollback_panic;
 mod divergence_regressions;
 mod far_call_decommitment;
 mod panic;

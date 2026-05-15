@@ -1,8 +1,6 @@
 use primitive_types::{H160, U256};
 use zkevm_opcode_defs::{
-    decoding::EncodingModeProduction,
-    ethereum_types::Address,
-    system_params::VM_MAX_STACK_DEPTH,
+    decoding::EncodingModeProduction, ethereum_types::Address, system_params::VM_MAX_STACK_DEPTH,
     Condition, DecodedOpcode, ImmMemHandlerFlags, Opcode, Operand, RegOrImmFlags, UMAOpcode,
     OPCODES_TABLE, UMA_INCREMENT_FLAG_IDX,
 };

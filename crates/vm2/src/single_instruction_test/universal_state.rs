@@ -5,7 +5,9 @@ use zk_evm::{
 };
 use zkevm_opcode_defs::decoding::EncodingModeProduction;
 
-use super::into_zk_evm::{ExpectedHeapValue, MockDecommitter, MockMemory, MockWorldWrapper, NoOracle};
+use super::into_zk_evm::{
+    ExpectedHeapValue, MockDecommitter, MockMemory, MockWorldWrapper, NoOracle,
+};
 
 #[derive(PartialEq, Debug)]
 pub struct UniversalVmState {

@@ -95,7 +95,9 @@ fn far_call_panic_followed_by_pointer_read_does_not_crash_host() {
     //         `decode_program`) — drains all gas and exits with
     //         `ExecutionEnd::Panicked`.
     let bytecode: Vec<u8> = [
-        encode_far_call_normal(/* abi_reg */ 1, /* dst_reg */ 2, /* exception_handler */ 1),
+        encode_far_call_normal(
+            /* abi_reg */ 1, /* dst_reg */ 2, /* exception_handler */ 1,
+        ),
         encode_fat_pointer_read(/* src_reg */ 1, /* dst_reg */ 3),
     ]
     .iter()
