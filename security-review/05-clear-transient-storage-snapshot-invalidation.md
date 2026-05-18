@@ -2,7 +2,7 @@
 
 - **Severity:** LOW
 - **Category:** snapshot consistency / host panic
-- **Exploitability:** Unlikely under the current era-contracts bootloader: `IncrementTxNumber` is emitted only at the top of the bootloader frame ([`bootloader.yul:4622`](../../era-contracts/system-contracts/bootloader/bootloader.yul#L4622)), after `processTx` has returned and all near-calls have unwound. Confirming *total* unexploitability — across alternate kernel contracts, future bootloader revisions, and embedders that ship a different bootloader against vm2 — is outside this review's scope. The safety is structural to one specific bootloader bytecode, not enforced by vm2.
+- **Exploitability:** Unlikely under the current era-contracts bootloader: `IncrementTxNumber` is emitted only at the top of the bootloader frame ([`bootloader.yul:4622`](../../era-contracts/system-contracts/bootloader/bootloader.yul#L4622)), after `processTx` has returned and all near-calls have unwound. Confirming total unexploitability is outside this review's scope. The safety is structural to one specific bootloader bytecode, not enforced by vm2.
 
 
 ## Summary
