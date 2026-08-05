@@ -302,14 +302,48 @@ impl<T: Tracer, W> VirtualMachine<T, W> {
             }
         }
 
-        // The kept returndata heap survives, but a bounded fat pointer can only
-        // ever address `[start, start + length)` of it (EraVM pointers narrow,
-        // never widen). Free every chunk outside that window: unreachable, so
-        // observably equivalent to keeping it, and it caps retained memory at
-        // the bytes the callee actually returned. Decommit-pinned pages (shared
-        // code, read in full by other frames) are left intact.
+        // The kept returndata heap survives. Freeing the chunks outside
+        // `[start, start + length)` is sound only when no live frame can *name* the page: for a
+        // page the dying frame owns, the returned pointer is the only remaining handle to it
+        // (EraVM pointers narrow, never widen, and every register except r1 is cleared on
+        // return), so the compaction is observably equivalent to keeping the page and caps
+        // retained memory at the bytes the callee actually returned.
+        //
+        // Ownership is what makes that true, hence the `heap`/`aux_heap` test below. A
+        // kernel-mode frame may return a pointer naming *any* page, including its
+        // `calldata_heap`, which belongs to an older frame that is still live (see the
+        // `is_kernel` branch in `naked_ret`, which deliberately mirrors zk_evm). Such a page is
+        // read directly via `HeapRead`, which no fat pointer bounds, and zk_evm never frees a
+        // memory page at all — so compacting it would be a silent consensus divergence. Do not
+        // widen the test to `heaps_i_am_keeping_alive`: that list is populated after the swap
+        // below with whatever page the *child's* returned pointer named, so it can hold a live
+        // ancestor's heap and is not an ownership claim.
+        //
+        // Decommit-pinned pages (shared code, read in full by other frames) are left intact
+        // even when owned — `Decommit` passes `current_frame.heap` as the candidate page, so
+        // the pin is their only protection.
+        //
+        // Ownership is necessary for this to be sound, but it is not sufficient, which is why
+        // the invariant above is phrased as "name" rather than "address through a pointer":
+        // two readers take a raw page id with no pointer at all — `PrecompileCall`'s
+        // `memory_page_to_read` and the `read_heap_byte`/`read_heap_u256` tracer API. Both see
+        // a compacted page as zeros, including in the owned case compacted here: a kernel frame
+        // can put a dead frame's page id in a precompile ABI and hash bytes outside the window,
+        // yielding a different digest than zk_evm. That is a real divergence, reproduced by a
+        // contract-driven test; it is out of reach in production only because every
+        // system-contract wrapper builds that ABI through `unsafePackPrecompileParams`, which
+        // leaves the field zero — convention, not enforcement. See
+        // `security-review/heaps/06-raw-page-readers-bypass-returndata-window-compaction.md`.
+        //
+        // Separately, the keep-alive *deallocation* sinks above and in
+        // `reclaim_bootloader_returndata_heaps` have the same smuggled-page-id problem and
+        // remain open; they predate this compaction and are not addressed here.
         if let (Some(heap), Some((start, length))) = (heap_to_keep, keep_window) {
-            if !self.world_diff.is_decommit_page_pinned(heap) {
+            // `current_frame` is still the dying frame here — the `mem::swap` is below.
+            let dying = &self.state.current_frame;
+            if (heap == dying.heap || heap == dying.aux_heap)
+                && !self.world_diff.is_decommit_page_pinned(heap)
+            {
                 self.state.heaps.compact_to_window(heap, start, length);
             }
         }
